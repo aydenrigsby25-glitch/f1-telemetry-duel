@@ -70,7 +70,8 @@ def load_session(session_key: int):
 
 
 @st.cache_data(show_spinner=False, max_entries=64)
-def run_duel(session_key: int, row_a: dict, row_b: dict) -> f1.DuelResult:
+def run_duel(session_key: int, row_a: dict, row_b: dict, version: int) -> f1.DuelResult:
+    """`version` is part of the cache key so analysis changes invalidate old results."""
     laps = []
     for row in (row_a, row_b):
         car, loc = data.get_lap_telemetry(
@@ -203,7 +204,7 @@ def row_for(code: str) -> dict:
 
 with st.spinner(f"Crunching telemetry: {driver_a} vs {driver_b}..."):
     try:
-        res = run_duel(loaded_key, row_for(driver_a), row_for(driver_b))
+        res = run_duel(loaded_key, row_for(driver_a), row_for(driver_b), f1.ANALYSIS_VERSION)
     except Exception as e:
         st.error(f"Couldn't build this comparison: {e}")
         st.stop()

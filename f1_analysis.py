@@ -33,6 +33,9 @@ import pandas as pd
 DRIVER_A_COLOR = "#00D9FF"  # electric blue
 DRIVER_B_COLOR = "#FF3366"  # signal red
 
+# Bump when the analysis changes, so cached results from older code are discarded.
+ANALYSIS_VERSION = 2
+
 DISTANCE_STEP_M = 2.0  # resolution of the common distance grid, in meters
 SPEED_FILTER_WINDOW = 3  # samples in the rolling median used to remove spikes
 
