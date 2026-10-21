@@ -7,7 +7,7 @@ TRACK_M = 5000.0
 LAP_START = pd.Timestamp("2025-12-06T14:59:31.374", tz="UTC")
 
 
-def simulate(speed_fn, hz=3.7, loc_offset_s=0.11, noise=0.0, seed=0, sensor_scale=None):
+def simulate(speed_fn, hz=3.7, loc_offset_s=0.11, noise=0.0, seed=0, sensor_scale=None, gps_noise_m=0.0):
     """Drive a 5 km circular track at speed_fn(distance) km/h.
 
     Returns (car_df, loc_df, lap_duration_s) in OpenF1's raw format. Car data
@@ -52,8 +52,8 @@ def simulate(speed_fn, hz=3.7, loc_offset_s=0.11, noise=0.0, seed=0, sensor_scal
     loc = pd.DataFrame(
         {
             "date": [(LAP_START + pd.Timedelta(seconds=float(x))).isoformat() for x in loc_t],
-            "x": np.cos(ang) * 800,
-            "y": np.sin(ang) * 800,
+            "x": np.cos(ang) * 800 + rng.normal(0, gps_noise_m, len(ang)),
+            "y": np.sin(ang) * 800 + rng.normal(0, gps_noise_m, len(ang)),
             "z": 0,
         }
     )

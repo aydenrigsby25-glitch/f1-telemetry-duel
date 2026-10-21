@@ -128,3 +128,13 @@ def test_gps_alignment_removes_speed_sensor_drift():
     # ...with it, the laps are recognised as the same lap all the way round.
     res = f1.compare_laps(a, b, meta)
     assert np.abs(res.delta).max() < 0.1
+
+
+def test_gps_jitter_does_not_make_the_gap_curve_noisy():
+    # Real GPS jitters by a few meters per sample. The gap curve must stay smooth.
+    fn = lambda d: min(corner(1200, 110)(d), corner(2600, 90)(d), corner(4000, 130)(d))
+    a, ta = lap(fn, seed=1)
+    b, tb = lap(fn, seed=2, gps_noise_m=4.0, sensor_scale=lambda d: 1.02 if d < 2500 else 1.0)
+    res = f1.compare_laps(a, b, dict(driver_a="A", driver_b="B", lap_time_a=ta, lap_time_b=tb))
+    assert np.abs(res.delta).max() < 0.06        # identical driving stays level
+    assert np.abs(np.diff(res.delta)).max() < 0.01  # no jagged jumps between 2 m steps

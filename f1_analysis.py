@@ -34,10 +34,12 @@ DRIVER_A_COLOR = "#00D9FF"  # electric blue
 DRIVER_B_COLOR = "#FF3366"  # signal red
 
 # Bump when the analysis changes, so cached results from older code are discarded.
-ANALYSIS_VERSION = 2
+ANALYSIS_VERSION = 3
 
 DISTANCE_STEP_M = 2.0  # resolution of the common distance grid, in meters
 SPEED_FILTER_WINDOW = 3  # samples in the rolling median used to remove spikes
+GPS_MEDIAN_WINDOW = 5    # samples; drops single GPS outliers
+GPS_SMOOTH_WINDOW = 15   # samples (~4 s at 3.7 Hz); keeps only slow drift
 
 # Channels the app plots. Distance and Time are required for alignment.
 CHANNELS = ["Speed", "Throttle", "Brake", "nGear", "X", "Y"]
@@ -145,11 +147,25 @@ def project_onto_reference(ref: pd.DataFrame, other: pd.DataFrame, window_m: flo
             if curv > 0:
                 matched[i] += float(np.clip(0.5 * (f[0] - f[2]) / curv, -0.5, 0.5))
 
+    # Complementary filter: GPS matching has no drift but a few meters of
+    # jitter per sample; integrated speed is smooth but drifts. Keep the
+    # integrated distance and correct it with only the slow-moving part of
+    # the GPS difference (median to drop outliers, then a ~4 s moving mean).
+    integrated = other["Distance"].to_numpy() * (ref_end / other["Distance"].iloc[-1])
+    correction = pd.Series(matched - integrated)
+    correction.iloc[0] = 0.0
+    correction.iloc[-1] = 0.0
+    smooth = (
+        correction.rolling(GPS_MEDIAN_WINDOW, center=True, min_periods=1).median()
+        .rolling(GPS_SMOOTH_WINDOW, center=True, min_periods=1).mean()
+        .to_numpy()
+    )
+    # The lap starts and ends on the line by definition: remove whatever
+    # correction is left at the ends with a straight ramp, so there's no step.
+    smooth -= np.linspace(smooth[0], smooth[-1], len(smooth))
+
     out = other.copy()
-    out["Distance"] = matched
-    # The lap starts and ends on the line by definition.
-    out.loc[out.index[0], "Distance"] = 0.0
-    out.loc[out.index[-1], "Distance"] = ref_end
+    out["Distance"] = integrated + smooth
     return out
 
 

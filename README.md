@@ -13,10 +13,13 @@ gains or loses time on track.
    arrive as separate streams on different timestamps, so position is
    interpolated onto the car-data timestamps.
 2. **Computes distance by integrating speed over time** (trapezoid rule),
-   then re-measures the second lap along the first lap's GPS racing line.
-   Integrated speed drifts slightly differently on every lap, which shows up
-   as fake time swings in braking zones; matching GPS positions makes the
-   same distance mean the same spot on track for both drivers.
+   then corrects the second lap against the first lap's GPS racing line.
+   Integrated speed is smooth but drifts slightly differently on every lap,
+   which shows up as fake time swings in braking zones. GPS matching doesn't
+   drift but jitters by a few meters per sample. A complementary filter
+   keeps the smooth integrated distance and applies only the slow-moving
+   part of the GPS correction, so the same distance means the same spot on
+   track for both drivers.
 3. **Cleans the data.** Rows with missing values are dropped, duplicate and
    out-of-order samples are removed so the distance axis only moves forward,
    small gaps are filled, and a short rolling median removes single-sample
@@ -67,7 +70,8 @@ The analysis is tested on simulated laps shaped exactly like OpenF1's
 responses, where the correct answer is known: two cars at constant speeds
 have an exact, computable gap, a car that's slower through one corner
 should lose all its time there, and two identical laps where one speed
-sensor reads 4% high must still come out level after GPS alignment. The full app is also run against fake API
+sensor reads high must still come out level, even with meters of GPS
+jitter, without the gap curve turning jagged. The full app is also run against fake API
 data, including the cases where the newest session fails to load and where
 the API rate-limits requests.
 
