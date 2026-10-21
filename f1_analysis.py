@@ -10,8 +10,9 @@ Pipeline for a duel:
      streams at different timestamps, so position is interpolated onto the
      car-data timestamps.
   2. Compute distance traveled by integrating speed over time (trapezoid
-     rule), then scale both laps to the same track length so small
-     integration errors don't misalign them.
+     rule), then re-measure the second lap's distance along the first lap's
+     GPS racing line, so the same distance means the same spot on track
+     for both drivers.
   3. Clean the telemetry (drop bad rows, keep distance strictly increasing,
      fill small gaps, filter single-sample speed spikes).
   4. Align both laps on a shared distance grid and compute the time gap
@@ -98,6 +99,54 @@ def scale_to_length(lap: pd.DataFrame, length_m: float) -> pd.DataFrame:
     """Stretch a lap's distance axis so it ends exactly at `length_m`."""
     out = lap.copy()
     out["Distance"] *= length_m / out["Distance"].iloc[-1]
+    return out
+
+
+def project_onto_reference(ref: pd.DataFrame, other: pd.DataFrame, window_m: float = 250.0) -> pd.DataFrame:
+    """Re-measure `other`'s distance along `ref`'s racing line using GPS.
+
+    Integrated speed drifts a little differently on every lap, so "3000 m"
+    on one lap isn't quite the same place as "3000 m" on another. That shows
+    up as fake time swings in braking zones. Instead, each GPS point of the
+    other lap is matched to the nearest point on the reference lap's path,
+    and takes the reference lap's distance at that spot. The search is
+    limited to a window around where the point should be, so a nearby
+    stretch of track (for example a hairpin or a parallel straight) can't
+    be matched by mistake.
+    """
+    if not {"X", "Y"} <= set(ref.columns) or not {"X", "Y"} <= set(other.columns):
+        return other
+
+    ref_end = ref["Distance"].iloc[-1]
+    d_ref = np.arange(0.0, ref_end, 1.0)
+    x_ref = np.interp(d_ref, ref["Distance"], ref["X"])
+    y_ref = np.interp(d_ref, ref["Distance"], ref["Y"])
+
+    guess = other["Distance"].to_numpy() * (ref_end / other["Distance"].iloc[-1])
+    ox, oy = other["X"].to_numpy(), other["Y"].to_numpy()
+    w = int(window_m)
+    matched = np.empty(len(other))
+    for i, g in enumerate(guess):
+        c = int(round(g))
+        lo, hi = max(0, c - w), min(len(d_ref), c + w + 1)
+        if hi <= lo:
+            matched[i] = g
+            continue
+        j = lo + int(np.argmin((x_ref[lo:hi] - ox[i]) ** 2 + (y_ref[lo:hi] - oy[i]) ** 2))
+        matched[i] = d_ref[j]
+        # Refine below 1 m: fit a parabola through the squared distances at
+        # j-1, j, j+1 and take its minimum.
+        if 0 < j < len(d_ref) - 1:
+            f = (x_ref[j - 1:j + 2] - ox[i]) ** 2 + (y_ref[j - 1:j + 2] - oy[i]) ** 2
+            curv = f[0] - 2 * f[1] + f[2]
+            if curv > 0:
+                matched[i] += float(np.clip(0.5 * (f[0] - f[2]) / curv, -0.5, 0.5))
+
+    out = other.copy()
+    out["Distance"] = matched
+    # The lap starts and ends on the line by definition.
+    out.loc[out.index[0], "Distance"] = 0.0
+    out.loc[out.index[-1], "Distance"] = ref_end
     return out
 
 
@@ -267,8 +316,10 @@ def compare_laps(lap_a: pd.DataFrame, lap_b: pd.DataFrame, meta: dict) -> DuelRe
     `meta` holds driver_a, driver_b, team_a, team_b, lap_time_a, lap_time_b.
     """
     track_len = (lap_a["Distance"].iloc[-1] + lap_b["Distance"].iloc[-1]) / 2
-    a_clean = clean_telemetry(scale_to_length(lap_a, track_len))
-    b_clean = clean_telemetry(scale_to_length(lap_b, track_len))
+    ref = scale_to_length(lap_a, track_len)
+    other = project_onto_reference(ref, scale_to_length(lap_b, track_len))
+    a_clean = clean_telemetry(ref)
+    b_clean = clean_telemetry(other)
 
     grid, a, b = align_laps(a_clean, b_clean)
     delta = b["Time"] - a["Time"]  # +ve => A ahead (B took longer to get here)

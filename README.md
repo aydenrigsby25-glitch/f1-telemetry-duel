@@ -13,8 +13,10 @@ gains or loses time on track.
    arrive as separate streams on different timestamps, so position is
    interpolated onto the car-data timestamps.
 2. **Computes distance by integrating speed over time** (trapezoid rule),
-   then scales both laps to the same track length so small integration
-   errors don't misalign them.
+   then re-measures the second lap along the first lap's GPS racing line.
+   Integrated speed drifts slightly differently on every lap, which shows up
+   as fake time swings in braking zones; matching GPS positions makes the
+   same distance mean the same spot on track for both drivers.
 3. **Cleans the data.** Rows with missing values are dropped, duplicate and
    out-of-order samples are removed so the distance axis only moves forward,
    small gaps are filled, and a short rolling median removes single-sample
@@ -63,8 +65,9 @@ streamlit run app.py
 
 The analysis is tested on simulated laps shaped exactly like OpenF1's
 responses, where the correct answer is known: two cars at constant speeds
-have an exact, computable gap, and a car that's slower through one corner
-should lose all its time there. The full app is also run against fake API
+have an exact, computable gap, a car that's slower through one corner
+should lose all its time there, and two identical laps where one speed
+sensor reads 4% high must still come out level after GPS alignment. The full app is also run against fake API
 data, including the cases where the newest session fails to load and where
 the API rate-limits requests.
 

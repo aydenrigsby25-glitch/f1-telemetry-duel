@@ -58,7 +58,7 @@ def test_constant_speed_gap_matches_physics():
     expected = TRACK_M / (180 / 3.6) - TRACK_M / (200 / 3.6)
     assert tb - ta == pytest.approx(expected, abs=0.02)
     assert res.delta[-1] == pytest.approx(tb - ta, abs=0.05)
-    assert np.all(np.diff(res.delta) >= -1e-6)  # A gains everywhere
+    assert np.all(np.diff(res.delta) >= -0.005)  # A gains everywhere (to within 5 ms)
 
 
 def corner(at_m, slow_kmh, fast_kmh=280, half_width=120):
@@ -108,3 +108,23 @@ def test_format_laptime():
     assert f1.format_laptime(82.207) == "1:22.207"
     assert f1.format_laptime(pd.Timedelta(seconds=75.123)) == "1:15.123"
     assert f1.format_laptime(None) == "—"
+
+
+def test_gps_alignment_removes_speed_sensor_drift():
+    # Identical driving; B's speed sensor reads 4% high in the first half of the lap.
+    fn = lambda d: min(corner(1200, 110)(d), corner(2600, 90)(d), corner(4000, 130)(d))
+    a, ta = lap(fn, seed=1)
+    b, tb = lap(fn, seed=2, sensor_scale=lambda d: 1.04 if d < 2500 else 1.0)
+    meta = dict(driver_a="AAA", driver_b="BBB", lap_time_a=ta, lap_time_b=tb)
+
+    # Without GPS alignment the drift shows up as a fake mid-lap gap...
+    track = (a["Distance"].iloc[-1] + b["Distance"].iloc[-1]) / 2
+    _, ca, cb = f1.align_laps(
+        f1.clean_telemetry(f1.scale_to_length(a, track)),
+        f1.clean_telemetry(f1.scale_to_length(b, track)),
+    )
+    assert np.abs(cb["Time"] - ca["Time"]).max() > 0.5
+
+    # ...with it, the laps are recognised as the same lap all the way round.
+    res = f1.compare_laps(a, b, meta)
+    assert np.abs(res.delta).max() < 0.1

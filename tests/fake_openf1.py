@@ -7,7 +7,7 @@ TRACK_M = 5000.0
 LAP_START = pd.Timestamp("2025-12-06T14:59:31.374", tz="UTC")
 
 
-def simulate(speed_fn, hz=3.7, loc_offset_s=0.11, noise=0.0, seed=0):
+def simulate(speed_fn, hz=3.7, loc_offset_s=0.11, noise=0.0, seed=0, sensor_scale=None):
     """Drive a 5 km circular track at speed_fn(distance) km/h.
 
     Returns (car_df, loc_df, lap_duration_s) in OpenF1's raw format. Car data
@@ -28,7 +28,9 @@ def simulate(speed_fn, hz=3.7, loc_offset_s=0.11, noise=0.0, seed=0):
         return np.interp(times, ts, ds), np.interp(times, ts, vs)
 
     car_t = np.arange(0.03, duration, 1 / hz)
-    _, car_v = sample(car_t)
+    car_d, car_v = sample(car_t)
+    if sensor_scale is not None:  # speed sensor misreads; the car's real motion is unchanged
+        car_v = car_v * np.array([sensor_scale(x) for x in car_d])
     car_v = car_v + rng.normal(0, noise, len(car_v)) if noise else car_v
     braking = np.gradient(car_v) < -2
     car = pd.DataFrame(
