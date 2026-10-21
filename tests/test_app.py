@@ -1,143 +1,126 @@
-"""Run the whole Streamlit app against a fake FastF1 session (no network)."""
+"""Run the whole Streamlit app against fake OpenF1 data (no network)."""
 
 import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
 
-import f1_analysis as f1
-from tests.test_analysis import make_lap
+import f1_data as data
+from tests.fake_openf1 import LAP_START, simulate
 
-
-class FakeLap(dict):
-    def __init__(self, laptime, tel):
-        super().__init__(LapTime=laptime)
-        self._tel = tel
-
-    def get_telemetry(self):
-        return self._tel.copy()
-
-
-class FakeLaps(pd.DataFrame):
-    _metadata = ["_store"]
-
-    @property
-    def _constructor(self):
-        return FakeLaps
-
-    def pick_drivers(self, drivers):
-        out = FakeLaps(self[self["Driver"].isin(drivers)])
-        out._store = self._store
-        return out
-
-    def pick_fastest(self):
-        row = self.sort_values("LapTime").iloc[0]
-        return FakeLap(row["LapTime"], self._store[row["Driver"]])
-
-
-class FakeSession:
-    def __init__(self):
-        speeds = {"VER": 250, "NOR": 245, "LEC": 240}
-        self.tel = {d: make_lap(lambda x, s=s: s) for d, s in speeds.items()}
-        laps = FakeLaps(
-            {"Driver": list(speeds),
-             "LapTime": [t["Time"].iloc[-1] for t in self.tel.values()]}
-        )
-        laps._store = self.tel
-        self.laps = laps
-        self.drivers = list(speeds)
-        self.event = {"EventName": "Test Grand Prix"}
-
-    def get_driver(self, d):
-        return {"Abbreviation": d, "FirstName": d.title(), "LastName": "Driver", "TeamName": "Team"}
-
-    def get_circuit_info(self):
-        class CI:
-            corners = pd.DataFrame(
-                {"Number": [1, 2, 3], "Letter": ["", "", ""], "Distance": [1000.0, 2500.0, 4000.0]}
-            )
-        return CI()
-
-
-SCHEDULE = pd.DataFrame(
+NOW = pd.Timestamp.now(tz="UTC")
+MEETINGS = pd.DataFrame(
     {
-        "RoundNumber": [1, 2],
-        "EventName": ["Old Grand Prix", "Newest Grand Prix"],
-        "Location": ["A", "B"],
-        "Country": ["X", "Y"],
-        "EventDate": [pd.Timestamp.now() - pd.Timedelta(days=30),
-                      pd.Timestamp.now() - pd.Timedelta(days=5)],
+        "meeting_key": [1, 2],
+        "meeting_name": ["Old Grand Prix", "Newest Grand Prix"],
+        "location": ["A", "B"],
+        "date_start": [NOW - pd.Timedelta(days=30), NOW - pd.Timedelta(days=5)],
     }
+)
+SESSIONS = {
+    1: pd.DataFrame({"session_key": [11, 12], "session_name": ["Qualifying", "Race"],
+                     "date_start": [NOW] * 2, "date_end": [NOW] * 2}),
+    2: pd.DataFrame({"session_key": [21, 22], "session_name": ["Qualifying", "Race"],
+                     "date_start": [NOW] * 2, "date_end": [NOW] * 2}),
+}
+SPEEDS = {1: 250, 4: 245, 16: 240}
+TEL = {n: simulate(lambda d, s=s: s, seed=n) for n, s in SPEEDS.items()}
+DRIVERS = pd.DataFrame(
+    {"driver_number": [1, 4, 16], "name_acronym": ["VER", "NOR", "LEC"],
+     "full_name": ["Max VERSTAPPEN", "Lando NORRIS", "Charles LECLERC"],
+     "team_name": ["Red Bull Racing", "McLaren", "Ferrari"], "team_colour": ["", "", ""]}
 )
 
 
+def fake_laps(session_key):
+    return pd.DataFrame(
+        {"driver_number": list(SPEEDS), "lap_number": [5, 5, 5],
+         "lap_duration": [TEL[n][2] for n in SPEEDS], "date_start": [LAP_START] * 3}
+    )
+
+
 @pytest.fixture(autouse=True)
-def fake_fastf1(monkeypatch):
-    monkeypatch.setattr(f1, "get_event_schedule", lambda year: SCHEDULE)
-    monkeypatch.setattr(f1, "enable_cache", lambda: None)
+def fake_api(monkeypatch):
+    monkeypatch.setattr(data, "get_meetings", lambda year: MEETINGS)
+    monkeypatch.setattr(data, "get_sessions", lambda mk: SESSIONS[mk])
+    monkeypatch.setattr(data, "get_laps", fake_laps)
+    monkeypatch.setattr(data, "get_drivers", lambda sk: DRIVERS)
+    monkeypatch.setattr(
+        data, "get_lap_telemetry", lambda sk, num, start, dur: (TEL[num][0], TEL[num][1])
+    )
 
 
 def run_app():
-    at = AppTest.from_file("../app.py", default_timeout=60)
+    at = AppTest.from_file("../app.py", default_timeout=120)
     at.run()
     return at
 
 
-def test_app_renders_a_duel(monkeypatch):
-    monkeypatch.setattr(f1, "load_session", lambda y, e, c: FakeSession())
+def test_app_renders_a_duel():
     at = run_app()
     assert not at.exception, at.exception
     assert not at.error, [e.value for e in at.error]
-    assert "VER" in at.markdown[1].value and "NOR" in at.markdown[1].value
-    assert len(at.metric) == 4
+    header = at.markdown[1].value
+    assert "VER" in header and "NOR" in header
+    assert at.metric[0].value.startswith("1:")
+    assert "Newest Grand Prix" in at.markdown[2].value
 
 
 def test_app_falls_back_when_newest_session_fails(monkeypatch):
     calls = []
 
-    def flaky_load(y, event, code):
-        calls.append(event)
-        if event == "Newest Grand Prix":
-            raise f1.SessionLoadError("not published yet")
-        return FakeSession()
+    def flaky(session_key):
+        calls.append(session_key)
+        if session_key == 21:
+            raise data.DataUnavailableError("not published yet")
+        return fake_laps(session_key)
 
-    monkeypatch.setattr(f1, "load_session", flaky_load)
+    monkeypatch.setattr(data, "get_laps", flaky)
     at = run_app()
     assert not at.exception, at.exception
-    assert calls[:2] == ["Newest Grand Prix", "Old Grand Prix"]
+    assert calls[:2] == [21, 11]
     assert any("Old Grand Prix" in i.value for i in at.info)
 
 
-def test_app_shows_message_instead_of_crashing_when_nothing_loads(monkeypatch):
-    def always_fail(y, e, c):
-        raise f1.SessionLoadError("feed down")
+def test_app_shows_instructions_instead_of_crashing_when_nothing_loads(monkeypatch):
+    def always_fail(session_key):
+        raise data.DataUnavailableError("API down")
 
-    monkeypatch.setattr(f1, "load_session", always_fail)
+    monkeypatch.setattr(data, "get_laps", always_fail)
     at = run_app()
     assert not at.exception, at.exception
     assert any("Load session" in m.value for m in at.markdown)
 
 
-def test_half_loaded_session_is_rejected_not_cached(monkeypatch):
-    """Reproduces the production crash: session.load() 'succeeds' but laps never load."""
-    from fastf1.exceptions import DataNotLoadedError
+def test_switching_drivers_works():
+    at = run_app()
+    at.sidebar.selectbox[3].set_value("LEC").run()
+    assert not at.exception, at.exception
+    assert "LEC" in at.markdown[1].value
 
-    class HalfLoaded:
-        def load(self, **kw):
-            pass  # FastF1 logs the download failure and returns normally
 
-        @property
-        def laps(self):
-            raise DataNotLoadedError("The data you are trying to access has not been loaded yet.")
+def test_client_retries_after_rate_limit(monkeypatch):
+    class Resp:
+        def __init__(self, code, body):
+            self.status_code, self._body, self.headers = code, body, {"Retry-After": "0"}
+            self.ok = code < 400
 
-    attempts = []
+        def json(self):
+            return self._body
 
-    def fake_get_session(y, e, c):
-        attempts.append(1)
-        return HalfLoaded()
+    replies = [Resp(429, None), Resp(200, [{"meeting_key": 1}])]
+    monkeypatch.setattr(data.requests, "get", lambda *a, **k: replies.pop(0))
+    monkeypatch.setattr(data, "MIN_INTERVAL_S", 0)
+    assert data._get("meetings", {"year": 2025}) == [{"meeting_key": 1}]
+    assert not replies
 
-    monkeypatch.setattr(f1.fastf1, "get_session", fake_get_session)
-    f1.load_session.clear()
-    for _ in range(2):
-        with pytest.raises(f1.SessionLoadError):
-            f1.load_session(2026, "Some Grand Prix", "Q")
-    assert len(attempts) == 2  # failure was not cached; second call retried
+
+def test_client_treats_no_results_as_empty(monkeypatch):
+    class Resp:
+        status_code, ok, headers = 200, True, {}
+
+        def json(self):
+            return {"detail": "No results found."}
+
+    monkeypatch.setattr(data.requests, "get", lambda *a, **k: Resp())
+    monkeypatch.setattr(data, "MIN_INTERVAL_S", 0)
+    assert data._get("laps", {"session_key": 1}) == []

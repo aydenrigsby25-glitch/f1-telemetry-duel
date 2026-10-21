@@ -1,9 +1,9 @@
 """
 F1 Telemetry Duel
-An interactive tool that overlays two drivers' real telemetry from the same
-lap to show exactly where one gains or loses time on track.
+An interactive tool that compares two drivers' real telemetry from their
+fastest laps to show exactly where one gains or loses time on track.
 
-Data: official F1 timing/car telemetry via the FastF1 library.
+Data: official F1 timing and car telemetry via the OpenF1 API (2023 onward).
 """
 
 import datetime as dt
@@ -15,6 +15,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 import f1_analysis as f1
+import f1_data as data
 
 st.set_page_config(
     page_title="F1 Telemetry Duel",
@@ -55,100 +56,112 @@ CUSTOM_CSS = f"""
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-f1.enable_cache()
+
+# ------------------------------------------------------------ data helpers --
+
+def load_session(session_key: int):
+    """Laps + drivers for a session. Raises DataUnavailableError if missing."""
+    laps = data.get_laps(session_key)
+    drivers = data.get_drivers(session_key)
+    best = data.fastest_laps(laps).merge(drivers, on="driver_number", how="inner")
+    if len(best) < 2:
+        raise data.DataUnavailableError("Fewer than two drivers set a timed lap in this session.")
+    return best
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def run_duel(session_key: int, row_a: dict, row_b: dict) -> f1.DuelResult:
+    laps = []
+    for row in (row_a, row_b):
+        car, loc = data.get_lap_telemetry(
+            session_key, int(row["driver_number"]), row["date_start"], float(row["lap_duration"])
+        )
+        laps.append(f1.build_lap_telemetry(car, loc, row["date_start"], float(row["lap_duration"])))
+    meta = {
+        "driver_a": row_a["name_acronym"], "driver_b": row_b["name_acronym"],
+        "team_a": row_a["team_name"], "team_b": row_b["team_name"],
+        "lap_time_a": row_a["lap_duration"], "lap_time_b": row_b["lap_duration"],
+    }
+    return f1.compare_laps(laps[0], laps[1], meta)
+
+
+def pick_default_session(sessions: pd.DataFrame):
+    """Qualifying if the weekend has it, otherwise the latest session."""
+    quali = sessions[sessions["session_name"] == "Qualifying"]
+    return (quali if not quali.empty else sessions).iloc[-1]
+
 
 # ---------------------------------------------------------------- sidebar --
 st.sidebar.title("🏎️ F1 Telemetry Duel")
-st.sidebar.caption("Real session data · powered by FastF1")
+st.sidebar.caption("Real F1 telemetry · powered by OpenF1")
 
 current_year = dt.date.today().year
-years = list(range(current_year, 2017, -1))
+years = list(range(current_year, data.FIRST_SEASON - 1, -1))
 year = st.sidebar.selectbox("Season", years, index=0)
 
-with st.spinner("Loading race calendar..."):
-    try:
-        schedule = f1.get_event_schedule(year)
-    except Exception as e:
-        st.sidebar.error(f"Couldn't load {year} calendar: {e}")
-        st.stop()
+try:
+    meetings = data.get_meetings(year)
+except Exception as e:
+    st.sidebar.error(f"Couldn't load the {year} calendar: {e}")
+    st.stop()
+if meetings.empty:
+    st.sidebar.info(f"No {year} race weekends have happened yet. Pick an earlier season.")
+    st.stop()
 
-event_names = schedule["EventName"].tolist()
-# Default to the most recently *completed* race weekend, not the season
-# finale. Future events have no data, and the timing feed can take a couple
-# of days to publish full telemetry, so require the event to be 3+ days old.
-now = pd.Timestamp.now(tz=schedule["EventDate"].dt.tz)
-completed = schedule[schedule["EventDate"] <= now - pd.Timedelta(days=3)]
-completed_events = completed["EventName"].tolist()
-if completed_events:
-    default_event = completed_events[-1]
-elif not schedule.empty:
-    default_event = schedule.iloc[0]["EventName"]
-else:
-    default_event = None
-default_idx = event_names.index(default_event) if default_event in event_names else 0
-event_name = st.sidebar.selectbox("Grand Prix", event_names, index=default_idx)
+meeting_names = meetings["meeting_name"].tolist()
+meeting_name = st.sidebar.selectbox("Grand Prix", meeting_names, index=len(meeting_names) - 1)
+meeting_key = int(meetings.loc[meetings["meeting_name"] == meeting_name, "meeting_key"].iloc[-1])
 
-session_labels = {
-    "FP1": "Practice 1", "FP2": "Practice 2", "FP3": "Practice 3",
-    "Q": "Qualifying", "S": "Sprint", "SQ": "Sprint Qualifying", "R": "Race",
-}
-session_code = st.sidebar.selectbox(
-    "Session",
-    list(session_labels.keys()),
-    format_func=lambda c: session_labels[c],
-    index=3,  # Qualifying
+try:
+    sessions = data.get_sessions(meeting_key)
+except Exception as e:
+    st.sidebar.error(f"Couldn't load sessions: {e}")
+    st.stop()
+if sessions.empty:
+    st.sidebar.info("No completed sessions for this weekend yet.")
+    st.stop()
+
+session_names = sessions["session_name"].tolist()
+default_session = pick_default_session(sessions)["session_name"]
+session_name = st.sidebar.selectbox(
+    "Session", session_names, index=session_names.index(default_session)
 )
+session_key = int(sessions.loc[sessions["session_name"] == session_name, "session_key"].iloc[-1])
 
 load_clicked = st.sidebar.button("Load session", type="primary", width="stretch")
 
-if "session_key" not in st.session_state:
-    st.session_state.session_key = None
-    st.session_state.session_obj = None
-
-def try_load(y: int, ev: str, code: str):
-    """Load a session, returning (session, None) or (None, error message)."""
-    try:
-        return f1.load_session(y, ev, code), None
-    except Exception as e:  # SessionLoadError, network errors, unknown event
-        return None, str(e) or e.__class__.__name__
-
+if "loaded" not in st.session_state:
+    st.session_state.loaded = None  # (session_key, label)
+    st.session_state.best = None
 
 if load_clicked:
-    # The user picked this session, so load exactly that and report problems.
-    key = (year, event_name, session_code)
-    if st.session_state.session_key != key:
-        with st.spinner(f"Pulling {year} {event_name} {session_labels[session_code]} data..."):
-            sess, err = try_load(*key)
-        if sess is None:
-            st.sidebar.error(f"That session isn't available right now: {err}")
-        else:
-            st.session_state.session_key = key
-            st.session_state.session_obj = sess
-
-elif st.session_state.session_key is None:
-    # First visit: auto-load a recent session, but if the newest one fails
-    # (data not published yet, feed hiccup), step back through earlier
-    # completed events instead of showing visitors an error.
-    candidates = [(year, ev, session_code) for ev in reversed(completed_events[-4:])]
-    if year - 1 >= 2018:
+    label = f"{year} {meeting_name} · {session_name}"
+    with st.spinner(f"Pulling {label} data..."):
         try:
-            prev = f1.get_event_schedule(year - 1)
-            if not prev.empty:
-                candidates.append((year - 1, prev.iloc[-1]["EventName"], session_code))
-        except Exception:
-            pass
-    with st.spinner("Loading the latest session with full telemetry..."):
-        for key in candidates:
-            sess, _ = try_load(*key)
-            if sess is not None:
-                st.session_state.session_key = key
-                st.session_state.session_obj = sess
+            st.session_state.best = load_session(session_key)
+            st.session_state.loaded = (session_key, label)
+        except Exception as e:
+            st.sidebar.error(f"That session isn't available right now: {e}")
+
+elif st.session_state.loaded is None:
+    # First visit: load the newest weekend's qualifying. If its data isn't
+    # published yet, step back through earlier weekends instead of erroring.
+    with st.spinner("Loading the latest session..."):
+        for _, m in meetings.iloc[::-1].head(4).iterrows():
+            try:
+                sess = data.get_sessions(int(m["meeting_key"]))
+                if sess.empty:
+                    continue
+                s = pick_default_session(sess)
+                st.session_state.best = load_session(int(s["session_key"]))
+                st.session_state.loaded = (
+                    int(s["session_key"]), f"{year} {m['meeting_name']} · {s['session_name']}"
+                )
                 break
+            except Exception:
+                continue
 
-session = st.session_state.session_obj
-session_key = st.session_state.session_key
-
-if session is None:
+if st.session_state.loaded is None:
     st.title("🏎️ F1 Telemetry Duel")
     st.write(
         "Pick a season, Grand Prix and session in the sidebar, then hit "
@@ -157,49 +170,46 @@ if session is None:
     )
     st.stop()
 
-# The session shown may be an auto-loaded fallback, so label it from the key.
-selected = (year, event_name, session_code)
-year, loaded_event, session_code = session_key
-if session_key != selected:
-    st.info(
-        f"Showing {year} {loaded_event} {session_labels[session_code]}. "
-        "Pick a different session in the sidebar and hit **Load session** to switch."
-    )
+loaded_key, loaded_label = st.session_state.loaded
+best = st.session_state.best
+if loaded_key != session_key:
+    st.info(f"Showing {loaded_label}. Hit **Load session** to switch to your selection.")
 
-try:
-    drivers = f1.list_drivers(session)
-except Exception as e:
-    st.error(f"Couldn't read driver laps for this session: {e}")
-    st.stop()
-if len(drivers) < 2:
-    st.error("Not enough driver data in this session yet.")
-    st.stop()
-
-driver_codes = [d["code"] for d in drivers]
-driver_labels = {d["code"]: f"{d['code']} — {d['name']} ({d['team']})" for d in drivers}
+codes = best["name_acronym"].tolist()
+labels = {
+    r.name_acronym: f"{r.name_acronym} — {r.full_name.title()} ({r.team_name})"
+    for r in best.itertuples()
+}
 
 st.sidebar.markdown("---")
-driver_a = st.sidebar.selectbox(
-    "Driver A", driver_codes, index=0, format_func=lambda c: driver_labels[c]
-)
-default_b_idx = 1 if len(driver_codes) > 1 else 0
-driver_b = st.sidebar.selectbox(
-    "Driver B", driver_codes, index=default_b_idx, format_func=lambda c: driver_labels[c]
-)
+driver_a = st.sidebar.selectbox("Driver A", codes, index=0, format_func=lambda c: labels[c])
+driver_b = st.sidebar.selectbox("Driver B", codes, index=1, format_func=lambda c: labels[c])
 
 if driver_a == driver_b:
     st.warning("Pick two different drivers to run a duel.")
     st.stop()
 
+
+def row_for(code: str) -> dict:
+    r = best[best["name_acronym"] == code].iloc[0]
+    return {
+        "driver_number": int(r["driver_number"]),
+        "name_acronym": r["name_acronym"],
+        "team_name": r["team_name"],
+        "lap_duration": float(r["lap_duration"]),
+        "date_start": pd.Timestamp(r["date_start"]).isoformat(),
+    }
+
+
 with st.spinner(f"Crunching telemetry: {driver_a} vs {driver_b}..."):
     try:
-        res = f1.compare_drivers(session_key, driver_a, driver_b, session)
+        res = run_duel(loaded_key, row_for(driver_a), row_for(driver_b))
     except Exception as e:
-        st.error(f"Couldn't build comparison: {e}")
+        st.error(f"Couldn't build this comparison: {e}")
         st.stop()
 
 # ------------------------------------------------------------------ header --
-gap = (res.lap_time_b - res.lap_time_a).total_seconds()
+gap = res.lap_time_b - res.lap_time_a
 leader = res.driver_a if gap > 0 else res.driver_b
 gap_abs = abs(gap)
 
@@ -211,8 +221,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.markdown(
-    f'<div class="duel-sub">{session.event["EventName"]} {year} · '
-    f'{session_labels[session_code]} · fastest laps compared</div>',
+    f'<div class="duel-sub">{loaded_label} · fastest laps compared</div>',
     unsafe_allow_html=True,
 )
 st.write("")
@@ -232,12 +241,12 @@ if not gains.empty:
     if best_a.gain_a_seconds > 0:
         parts.append(
             f'<b style="color:{A_COLOR}">{res.driver_a}</b> gains the most at '
-            f'<b>Turn {int(best_a.corner_number)}</b> (+{best_a.gain_a_seconds:.2f}s)'
+            f'<b>corner {int(best_a.corner_number)}</b> (+{best_a.gain_a_seconds:.2f}s)'
         )
     if best_b.gain_a_seconds < 0:
         parts.append(
             f'<b style="color:{B_COLOR}">{res.driver_b}</b> gains the most at '
-            f'<b>Turn {int(best_b.corner_number)}</b> (+{-best_b.gain_a_seconds:.2f}s)'
+            f'<b>corner {int(best_b.corner_number)}</b> (+{-best_b.gain_a_seconds:.2f}s)'
         )
     if parts:
         st.markdown(
@@ -347,14 +356,18 @@ st.plotly_chart(fig2, width="stretch", config={"displayModeBar": False})
 # --------------------------------------------------- corner-by-corner gain -
 st.subheader("Time gained / lost by corner")
 if gains.empty:
-    st.caption("Corner locations aren't available for this circuit, so the per-corner breakdown is skipped.")
+    st.caption("No clear braking zones were detected on this lap, so the per-corner breakdown is skipped.")
 else:
-    st.caption(f"Positive bars = {res.driver_a} gains time through that corner. Negative = {res.driver_b} does.")
+    st.caption(
+        f"Corners are detected from the speed trace (each major braking zone) and numbered in lap order, "
+        f"so numbers may differ from official turn numbers. Positive bars = {res.driver_a} gains time "
+        f"through that corner. Negative = {res.driver_b} does."
+    )
     gains_sorted = gains.sort_values("distance")
     bar_colors = [A_COLOR if v >= 0 else B_COLOR for v in gains_sorted["gain_a_seconds"]]
     fig3 = go.Figure(
         go.Bar(
-            x=[f"T{int(n)}{l}" for n, l in zip(gains_sorted["corner_number"], gains_sorted["letter"])],
+            x=[f"C{int(n)}" for n in gains_sorted["corner_number"]],
             y=gains_sorted["gain_a_seconds"],
             marker_color=bar_colors,
         )
@@ -369,7 +382,8 @@ else:
 
 st.markdown("---")
 st.caption(
-    "Data: FastF1 (official F1 timing & car telemetry). Corner attribution is "
-    "computed by segmenting the time-delta-vs-distance curve around each "
-    "circuit's real corner coordinates — not an official F1 statistic."
+    "Data: OpenF1 (official F1 timing & car telemetry, 2023 onward). Distance is "
+    "computed by integrating each car's speed over time; corner attribution "
+    "segments the time-gap curve around braking zones detected in the speed "
+    "trace. Not an official F1 statistic."
 )

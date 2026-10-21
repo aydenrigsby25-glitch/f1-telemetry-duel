@@ -1,47 +1,54 @@
 # F1 Telemetry Duel
 
 An interactive web app that pulls **real Formula 1 telemetry** (official car
-ECU + GPS data: speed, throttle, brake, gear, position, sampled multiple
-times per second) and compares two drivers' fastest laps to show exactly
-where one gains or loses time on track.
+data: speed, throttle, brake, gear, plus GPS position, sampled several times
+per second) and compares two drivers' fastest laps to show exactly where one
+gains or loses time on track.
 
 **Live app:** https://f1-telemetry-duel.streamlit.app
 
 ## How it works
 
-1. **Cleans the raw telemetry.** Each lap's data is filtered before any
-   comparison: rows with missing distance or time are dropped, duplicate and
-   out-of-order distance samples are removed so the distance axis only moves
-   forward, small gaps in other channels are filled, and a short rolling
-   median removes single-sample speed spikes.
-2. **Aligns both laps on a shared distance axis.** Cars cross the line at
-   different moments and log samples at different points on track, so raw
-   rows aren't comparable. Both laps are resampled onto the same 2 m
-   distance grid.
-3. **Builds a time-delta-vs-distance curve.** On that shared grid, the gap at
-   every point is driver B's elapsed lap time minus driver A's.
-4. **Attributes time gained or lost to individual corners.** Using each
-   circuit's real corner locations (from FastF1), the delta curve is split
-   into windows around every corner, and the change in the gap across each
-   window is the time won or lost there.
-5. **Renders a track dominance map.** The circuit outline is colored by which
-   driver is *gaining* time at each point (the slope of the delta curve),
-   not just who's faster in a straight line.
-
-## Reliability
-
-FastF1's `session.load()` doesn't raise an error when a download fails; it
-leaves the session half-loaded. The app checks that lap data actually
-arrived before using or caching a session. On first visit it loads the most
-recent completed session, and if that one isn't available yet it steps back
-to earlier events instead of showing an error. Dependencies are pinned to
-bounded version ranges so a future major release can't silently break it.
+1. **Builds each lap from raw telemetry feeds.** Car data and GPS position
+   arrive as separate streams on different timestamps, so position is
+   interpolated onto the car-data timestamps.
+2. **Computes distance by integrating speed over time** (trapezoid rule),
+   then scales both laps to the same track length so small integration
+   errors don't misalign them.
+3. **Cleans the data.** Rows with missing values are dropped, duplicate and
+   out-of-order samples are removed so the distance axis only moves forward,
+   small gaps are filled, and a short rolling median removes single-sample
+   speed spikes.
+4. **Aligns both laps on a shared distance grid** (every 2 m). Cars log
+   samples at different points on track, so raw rows aren't comparable until
+   they're resampled to the same places.
+5. **Builds a time-gap-vs-distance curve**: at every point on track, driver
+   B's elapsed lap time minus driver A's.
+6. **Detects corners from the speed trace** (each major braking zone) and
+   measures how much time each driver gained or lost through each one.
+7. **Renders a track dominance map**: the circuit outline colored by which
+   driver is *gaining* time at each point (the slope of the gap curve), not
+   just who's faster in a straight line.
 
 ## Data source
 
-[FastF1](https://github.com/theOehrly/Fast-F1), which sources official F1
-live-timing and car telemetry feeds. Data is cached locally after the first
-fetch, so repeat views of the same session are fast.
+[OpenF1](https://openf1.org), a free API serving official F1 timing and car
+telemetry from the 2023 season onward.
+
+The app originally used the FastF1 library. In October 2026 Formula 1 put
+its live-timing archive behind an F1 TV login, which stopped FastF1 from
+downloading sessions ([FastF1 issue #978](https://github.com/theOehrly/Fast-F1/issues/978)),
+so the data layer was moved to OpenF1. Requests are spaced out to respect
+OpenF1's free-tier rate limit, retried on HTTP 429, and cached.
+
+## Reliability
+
+- A session is only used once its lap data has actually loaded; a failed
+  load is retried rather than cached.
+- On first visit the app loads the latest qualifying session, and steps back
+  to earlier weekends if the newest one isn't published yet.
+- Dependencies are pinned to bounded version ranges so a future major
+  release can't silently break the app.
 
 ## Running it locally
 
@@ -54,10 +61,12 @@ streamlit run app.py
 
 ## Tests
 
-The analysis is tested on simulated laps where the correct answer is known
-(for example, two cars at constant speeds have an exact, computable gap),
-and the full app is run against a fake session, including the case where
-the newest session fails to load.
+The analysis is tested on simulated laps shaped exactly like OpenF1's
+responses, where the correct answer is known: two cars at constant speeds
+have an exact, computable gap, and a car that's slower through one corner
+should lose all its time there. The full app is also run against fake API
+data, including the cases where the newest session fails to load and where
+the API rate-limits requests.
 
 ```bash
 pip install -r requirements-dev.txt
@@ -66,4 +75,4 @@ python -m pytest -q
 
 ## Stack
 
-Python · pandas · NumPy · FastF1 · Streamlit · Plotly
+Python · pandas · NumPy · Streamlit · Plotly · OpenF1 API
