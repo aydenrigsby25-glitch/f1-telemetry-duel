@@ -74,11 +74,13 @@ with st.spinner("Loading race calendar..."):
 
 event_names = schedule["EventName"].tolist()
 # Default to the most recently *completed* race weekend, not the season
-# finale — future events on the calendar have no data yet.
+# finale. Future events have no data, and the timing feed can take a couple
+# of days to publish full telemetry, so require the event to be 3+ days old.
 now = pd.Timestamp.now(tz=schedule["EventDate"].dt.tz)
-completed = schedule[schedule["EventDate"] <= now]
-if not completed.empty:
-    default_event = completed.iloc[-1]["EventName"]
+completed = schedule[schedule["EventDate"] <= now - pd.Timedelta(days=3)]
+completed_events = completed["EventName"].tolist()
+if completed_events:
+    default_event = completed_events[-1]
 elif not schedule.empty:
     default_event = schedule.iloc[0]["EventName"]
 else:
@@ -103,17 +105,45 @@ if "session_key" not in st.session_state:
     st.session_state.session_key = None
     st.session_state.session_obj = None
 
-if load_clicked or st.session_state.session_key is None:
+def try_load(y: int, ev: str, code: str):
+    """Load a session, returning (session, None) or (None, error message)."""
+    try:
+        return f1.load_session(y, ev, code), None
+    except Exception as e:  # SessionLoadError, network errors, unknown event
+        return None, str(e) or e.__class__.__name__
+
+
+if load_clicked:
+    # The user picked this session, so load exactly that and report problems.
     key = (year, event_name, session_code)
     if st.session_state.session_key != key:
         with st.spinner(f"Pulling {year} {event_name} {session_labels[session_code]} data..."):
-            try:
-                sess = f1.load_session(year, event_name, session_code)
+            sess, err = try_load(*key)
+        if sess is None:
+            st.sidebar.error(f"That session isn't available right now: {err}")
+        else:
+            st.session_state.session_key = key
+            st.session_state.session_obj = sess
+
+elif st.session_state.session_key is None:
+    # First visit: auto-load a recent session, but if the newest one fails
+    # (data not published yet, feed hiccup), step back through earlier
+    # completed events instead of showing visitors an error.
+    candidates = [(year, ev, session_code) for ev in reversed(completed_events[-4:])]
+    if year - 1 >= 2018:
+        try:
+            prev = f1.get_event_schedule(year - 1)
+            if not prev.empty:
+                candidates.append((year - 1, prev.iloc[-1]["EventName"], session_code))
+        except Exception:
+            pass
+    with st.spinner("Loading the latest session with full telemetry..."):
+        for key in candidates:
+            sess, _ = try_load(*key)
+            if sess is not None:
                 st.session_state.session_key = key
                 st.session_state.session_obj = sess
-            except Exception as e:
-                st.sidebar.error(f"Session not available: {e}")
-                st.stop()
+                break
 
 session = st.session_state.session_obj
 session_key = st.session_state.session_key
@@ -127,7 +157,20 @@ if session is None:
     )
     st.stop()
 
-drivers = f1.list_drivers(session)
+# The session shown may be an auto-loaded fallback, so label it from the key.
+selected = (year, event_name, session_code)
+year, loaded_event, session_code = session_key
+if session_key != selected:
+    st.info(
+        f"Showing {year} {loaded_event} {session_labels[session_code]}. "
+        "Pick a different session in the sidebar and hit **Load session** to switch."
+    )
+
+try:
+    drivers = f1.list_drivers(session)
+except Exception as e:
+    st.error(f"Couldn't read driver laps for this session: {e}")
+    st.stop()
 if len(drivers) < 2:
     st.error("Not enough driver data in this session yet.")
     st.stop()
@@ -175,24 +218,32 @@ st.markdown(
 st.write("")
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric(f"{res.driver_a} lap", str(res.lap_time_a)[10:21])
-c2.metric(f"{res.driver_b} lap", str(res.lap_time_b)[10:21])
+c1.metric(f"{res.driver_a} lap", f1.format_laptime(res.lap_time_a))
+c2.metric(f"{res.driver_b} lap", f1.format_laptime(res.lap_time_b))
 c3.metric("Gap", f"{gap_abs:.3f}s", delta=f"{leader} ahead", delta_color="off")
 c4.metric("Top speed A / B", f"{res.speed_a.max():.0f} / {res.speed_b.max():.0f} km/h")
 
 # biggest single-corner swing, for a punchy narrative line
 gains = res.corner_gain
-best_a = gains.loc[gains["gain_a_seconds"].idxmax()]
-best_b = gains.loc[gains["gain_a_seconds"].idxmin()]
-st.markdown(
-    f'<div class="callout">🔑 Biggest swing: <b style="color:{A_COLOR}">{res.driver_a}</b> '
-    f'gains the most at <b>Turn {int(best_a.corner_number)}</b> '
-    f'(+{best_a.gain_a_seconds:.2f}s) · '
-    f'<b style="color:{B_COLOR}">{res.driver_b}</b> gains the most at '
-    f'<b>Turn {int(best_b.corner_number)}</b> '
-    f'(+{-best_b.gain_a_seconds:.2f}s)</div>',
-    unsafe_allow_html=True,
-)
+if not gains.empty:
+    best_a = gains.loc[gains["gain_a_seconds"].idxmax()]
+    best_b = gains.loc[gains["gain_a_seconds"].idxmin()]
+    parts = []
+    if best_a.gain_a_seconds > 0:
+        parts.append(
+            f'<b style="color:{A_COLOR}">{res.driver_a}</b> gains the most at '
+            f'<b>Turn {int(best_a.corner_number)}</b> (+{best_a.gain_a_seconds:.2f}s)'
+        )
+    if best_b.gain_a_seconds < 0:
+        parts.append(
+            f'<b style="color:{B_COLOR}">{res.driver_b}</b> gains the most at '
+            f'<b>Turn {int(best_b.corner_number)}</b> (+{-best_b.gain_a_seconds:.2f}s)'
+        )
+    if parts:
+        st.markdown(
+            '<div class="callout">🔑 Biggest swing: ' + " · ".join(parts) + "</div>",
+            unsafe_allow_html=True,
+        )
 
 # ------------------------------------------------------------ track map ----
 st.subheader("Track dominance map")
@@ -295,24 +346,26 @@ st.plotly_chart(fig2, width="stretch", config={"displayModeBar": False})
 
 # --------------------------------------------------- corner-by-corner gain -
 st.subheader("Time gained / lost by corner")
-st.caption(f"Positive bars = {res.driver_a} gains time through that corner. Negative = {res.driver_b} does.")
-
-gains_sorted = gains.sort_values("distance")
-bar_colors = [A_COLOR if v >= 0 else B_COLOR for v in gains_sorted["gain_a_seconds"]]
-fig3 = go.Figure(
-    go.Bar(
-        x=[f"T{int(n)}" for n in gains_sorted["corner_number"]],
-        y=gains_sorted["gain_a_seconds"],
-        marker_color=bar_colors,
+if gains.empty:
+    st.caption("Corner locations aren't available for this circuit, so the per-corner breakdown is skipped.")
+else:
+    st.caption(f"Positive bars = {res.driver_a} gains time through that corner. Negative = {res.driver_b} does.")
+    gains_sorted = gains.sort_values("distance")
+    bar_colors = [A_COLOR if v >= 0 else B_COLOR for v in gains_sorted["gain_a_seconds"]]
+    fig3 = go.Figure(
+        go.Bar(
+            x=[f"T{int(n)}{l}" for n, l in zip(gains_sorted["corner_number"], gains_sorted["letter"])],
+            y=gains_sorted["gain_a_seconds"],
+            marker_color=bar_colors,
+        )
     )
-)
-fig3.update_layout(
-    height=340, plot_bgcolor=BG, paper_bgcolor=BG, font=dict(color="#CCCCCC"),
-    margin=dict(l=10, r=10, t=10, b=10),
-    yaxis=dict(title="Seconds gained by " + res.driver_a, gridcolor=GRID, zerolinecolor=GRID),
-    xaxis=dict(gridcolor=GRID),
-)
-st.plotly_chart(fig3, width="stretch", config={"displayModeBar": False})
+    fig3.update_layout(
+        height=340, plot_bgcolor=BG, paper_bgcolor=BG, font=dict(color="#CCCCCC"),
+        margin=dict(l=10, r=10, t=10, b=10),
+        yaxis=dict(title="Seconds gained by " + res.driver_a, gridcolor=GRID, zerolinecolor=GRID),
+        xaxis=dict(gridcolor=GRID),
+    )
+    st.plotly_chart(fig3, width="stretch", config={"displayModeBar": False})
 
 st.markdown("---")
 st.caption(

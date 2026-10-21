@@ -1,5 +1,7 @@
-fastf1>=3.8
-streamlit>=1.58
-plotly>=6.0
-pandas>=2.0
-numpy>=1.26
+# Bounded ranges: new bug-fix releases are allowed, but a new major version
+# (the usual cause of an app silently breaking months later) is not.
+fastf1>=3.8.3,<3.9
+streamlit>=1.50,<2
+plotly>=6.0,<8
+pandas>=2.2,<3
+numpy>=2.0,<3
